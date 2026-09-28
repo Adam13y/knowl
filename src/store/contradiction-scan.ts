@@ -8,10 +8,19 @@
  * than letting either retire the other, tells the caller once in the write result, and then no
  * surface could ever list the pair again. This is that surface.
  *
- * ONE detected kind, and deliberately not two. `polarity` is titles on the same subject
+ * Detected kinds. `polarity` is titles on the same subject
  * differing only by polarity tokens: exact by construction, because these are precisely the
  * pairs the write path's own guard creates, so they are listed as contradictions rather than
  * candidates.
+ *
+ * `retired` and `sameSubject` exist because of #165. A same-subject write that retired a verified
+ * fact told only its writer -- in an injection, the one party that was fooled -- and this scan
+ * compared active items only, so the retired truth had nothing to pair with: 0 pairs in every
+ * red-team store. `retired` lists verified items retired in the last `RETIRED_WINDOW_DAYS`;
+ * `sameSubject` lists the pairs the write-path guards keep side by side when one side is verified.
+ * Both are filtered to stay short on a real store (4 rows each on this repository's own, against
+ * 147 superseded items and 838 same-subject active pairs unfiltered), for the precision reason
+ * given below.
  *
  * WHY REVERSAL CANDIDATES ARE NOT LISTED HERE. The cue-sentence detector
  * (`detectReversal`, still live on the write path) was measured against 101 real
@@ -31,8 +40,12 @@
  * an inspection command a person runs on purpose, and the wrong one for the write path, which
  * is why the write path's advisory gates on its own cue scan instead of calling this.
  */
+import type { KnowledgeItem, KnowledgeProvenance, KnowledgeStatus } from '../core/types.js';
 import * as repo from './repository.js';
-import { duplicateTokens, polarityTokensDiffer, sameSubjectTokens } from './knowledge-writer.js';
+import { duplicateTokens, isVerifiedProvenance, polarityTokensDiffer, sameSubjectTokens } from './knowledge-writer.js';
+
+/** A place to glance at recent swaps, not an audit log: `knowl_timeline` holds the full history. */
+export const RETIRED_WINDOW_DAYS = 14;
 
 export type ContradictionParty = { id: string; title: string; category: string };
 
@@ -42,8 +55,29 @@ export type PolarityContradiction = {
   b: ContradictionParty;
 };
 
+export type VerifiedParty = ContradictionParty & { provenance: KnowledgeProvenance | null };
+
+export type RetiredVerified = {
+  kind: 'retired';
+  retired: VerifiedParty;
+  /**
+   * `status` because the row outlives the swap: once the replacement is itself superseded -- by an
+   * undo that restores the retired value, or just by the next write on the subject -- the row still
+   * lists it for the rest of the window, and without the status an undone swap reads as live and a
+   * second reader "fixes" it again. The row itself stays, since the undo and a write that doubles
+   * down on the replacement look the same from here.
+   */
+  replacedBy: (VerifiedParty & { status: KnowledgeStatus }) | null;
+  /** The retired item's `updatedAt`, which the supersede update stamps. */
+  retiredAt: string;
+};
+
+export type SameSubjectPair = { kind: 'sameSubject'; a: VerifiedParty; b: VerifiedParty };
+
 export type DetectedContradictions = {
   polarity: PolarityContradiction[];
+  retired: RetiredVerified[];
+  sameSubject: SameSubjectPair[];
 };
 
 const party = (item: { id: string; title: string; category: string }): ContradictionParty => ({
@@ -52,8 +86,14 @@ const party = (item: { id: string; title: string; category: string }): Contradic
   category: item.category,
 });
 
-export async function scanContradictions(): Promise<DetectedContradictions> {
-  const items = (await repo.listKnowledgeItems()).filter(item => item.status === 'active');
+const verifiedParty = (item: KnowledgeItem): VerifiedParty => ({ ...party(item), provenance: item.provenance ?? null });
+
+const replacedSince = (row: RetiredVerified): boolean => row.replacedBy !== null && row.replacedBy.status !== 'active';
+
+export async function scanContradictions(options: { now?: Date } = {}): Promise<DetectedContradictions> {
+  const all = await repo.listKnowledgeItems();
+  const items = all.filter(item => item.status === 'active');
+  const byId = new Map(all.map(item => [item.id, item]));
 
   // Tokenized once per item rather than inside each predicate: the pair loop below is O(n^2)
   // and the two title predicates tokenize both sides, so the naive form paid four tokenizations
@@ -62,14 +102,42 @@ export async function scanContradictions(): Promise<DetectedContradictions> {
   const titleTokens = items.map(item => duplicateTokens(item.title));
 
   const polarity: PolarityContradiction[] = [];
+  const sameSubject: SameSubjectPair[] = [];
   for (let i = 0; i < items.length; i++) {
     for (let j = i + 1; j < items.length; j++) {
-      if (sameSubjectTokens(titleTokens[i], titleTokens[j])
-        && polarityTokensDiffer(titleTokens[i], titleTokens[j])) {
+      if (!sameSubjectTokens(titleTokens[i], titleTokens[j])) continue;
+      if (polarityTokensDiffer(titleTokens[i], titleTokens[j])) {
         polarity.push({ kind: 'polarity', a: party(items[i]), b: party(items[j]) });
+      } else if (
+        items[i].category === items[j].category
+        && (isVerifiedProvenance(items[i]) || isVerifiedProvenance(items[j]))
+      ) {
+        sameSubject.push({ kind: 'sameSubject', a: verifiedParty(items[i]), b: verifiedParty(items[j]) });
       }
     }
   }
 
-  return { polarity };
+  const since = (options.now ?? new Date()).getTime() - RETIRED_WINDOW_DAYS * 86_400_000;
+  const retired: RetiredVerified[] = all
+    .filter(item => item.status === 'superseded' && isVerifiedProvenance(item)
+      && Date.parse(item.updatedAt) >= since)
+    .map((item): RetiredVerified => {
+      const next = item.supersededById ? byId.get(item.supersededById) : undefined;
+      return {
+        kind: 'retired',
+        retired: verifiedParty(item),
+        replacedBy: next ? { ...verifiedParty(next), status: next.status } : null,
+        retiredAt: item.updatedAt,
+      };
+    })
+    // Rows whose replacement has itself been replaced last, then newest first. MCP keeps five
+    // rows: a swap whose replacement was since superseded is more likely already dealt with than
+    // one whose replacement still answers queries -- likelier, not certain, as a double-down looks
+    // the same -- and a fact retired with nothing named in its place is not dealt with at all. The
+    // store returns creation order, so without the date key an injected swap of a recently created
+    // fact would be the row the truncation hides.
+    .sort((a, b) => Number(replacedSince(a)) - Number(replacedSince(b))
+      || b.retiredAt.localeCompare(a.retiredAt));
+
+  return { polarity, retired, sameSubject };
 }

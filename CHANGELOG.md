@@ -65,6 +65,24 @@ derivation likewise overwrote an exclusive `state` item that nobody had verified
 now keeps its atom beside the exclusive item; derivation leaves it unchanged and does not write the
 derived value.
 
+### `knowl conflicts` lists retired verified facts and the pairs the write path keeps side by side
+
+A same-subject write that retired a verified fact told only its writer, and `knowl conflicts`
+compared active items only, so the retired fact had nothing to pair with (#165). It now also
+lists `observed`/`user_stated` items retired in the last 14 days with what replaced each, and
+same-subject active pairs with a verified side, which the new write guards keep side by side
+instead of superseding. On this repository's own store both lists hold a handful of rows.
+
+### `knowl conflicts` says whether a listed retirement still stands
+
+A retired fact stayed listed for its whole 14 days with what replaced it, even after someone had
+undone the swap by superseding that replacement, so it read as a live swap a second reader might
+"fix" again. Each retirement's replacement now carries its `status`. Rows whose replacement has
+itself been replaced stay listed, but after the rest, newest first in each group; that state also
+follows a plain second write on the subject, so it means "look again", not "resolved". On this
+repository's own store, 2 of the 5 listed retirements are in that state, both from a later verified
+edit of the same fact rather than an undo.
+
 ## 5.23.1 — 2026-09-18
 
 ### Installing with pnpm produced a package that could not build or run
