@@ -627,6 +627,11 @@ export function resolveDuplicate(
   // refusing a supersession, and a pair left coexisting is invisible afterwards: `knowl_conflicts`
   // reads only `conflictKey`/`conflictExclusive`, set on 3 of 937 active items.
   if (differsOnlyInPolarity(input, duplicate)) return 'coexist';
+  // The author marked this the one active answer to its key. `checkKnowledgeConflict` only
+  // stops a writer that volunteers the same key, so a write that simply left the key out
+  // retired it anyway: 36 of 36 in the #165 red team, against 36 of 36 refused with the key.
+  // Honoured from the held side here; retiring it takes an explicit `supersedes`.
+  if (duplicate.conflictExclusive) return 'coexist';
 
   // Provenance still does not gate a DIRECT write (the measurement above stands: 5 of 139 real
   // supersessions are unclaimed corrections of observed items, all through knowl_store). What it
@@ -635,6 +640,20 @@ export function resolveDuplicate(
   if (channel === 'automatic' && isVerifiedProvenance(duplicate)) return 'coexist';
 
   return 'supersede';
+}
+
+/**
+ * The id the exclusive-key checks may ignore: the item this write will retire, chosen exactly as
+ * `resolveSupersedeTarget` chooses it. Exempting the named `supersedes` id alone let a write name
+ * the holder while a different qualifying duplicate was the one retired, which left the holder
+ * active beside a new row claiming its key -- two answers to a key that allows one.
+ */
+function retiringId(
+  input: { supersedes?: string },
+  duplicate: KnowledgeItem | null,
+  resolution: DuplicateResolution | null,
+): string | undefined {
+  return duplicate && resolution === 'supersede' ? duplicate.id : input.supersedes;
 }
 
 // Resolve the item (if any) that a new write should mark superseded: the detected
@@ -826,12 +845,13 @@ export async function storeKnowledgeItemDeduped(
 ): Promise<StoreKnowledgeResult> {
   assertConfidenceInRange(input.confidence, input.title);
   validationOptions ??= await securityForWrite();
-  const conflicts = await checkKnowledgeConflict(input);
-  if (conflicts.length) throw new KnowledgeConflictError(conflicts.map(item => ({ id: item.id, title: item.title })));
   const duplicate = await findLikelyDuplicateKnowledgeItem(projectId, input);
   const resolution = duplicate
     ? resolveDuplicate(input, duplicate, await heldPayloadFor(input, duplicate), channel)
     : null;
+  const retiring = retiringId(input, duplicate, resolution);
+  const conflicts = await checkKnowledgeConflict({ ...input, supersedes: retiring });
+  if (conflicts.length) throw new KnowledgeConflictError(conflicts.map(item => ({ id: item.id, title: item.title })));
   if (duplicate && resolution === 'no-op' && !input.supersedes) {
     // The agent reached this conclusion again and the store already had it. That is the one
     // positive capture signal in the system, and until now it was computed and discarded.
@@ -865,6 +885,7 @@ export async function storeKnowledgeItemDeduped(
       input.steps,
       conn,
       validationOptions,
+      retiring,
     );
     await attachEvidenceToKnowledge(written.id, input.evidence, input);
 
@@ -991,6 +1012,7 @@ export async function storeKnowledgeAtomsDeduped(
         atom.steps,
         conn,
         validationOptions,
+        retiringId(atom, duplicate, resolution),
       );
       await attachEvidenceToKnowledge(item.id, atom.evidence, atom);
 
