@@ -329,6 +329,71 @@ export function polarityTokensDiffer(left: Set<string>, right: Set<string>): boo
   return added > 0;
 }
 
+/**
+ * The value-bearing words of a body: digit-bearing (`35`, `eu-central-1`, `v5.23.1`) or
+ * capitalised mid-sentence (`PostgreSQL`, `Stripe`, `UTC`). Lowercased for comparison.
+ *
+ * A sentence's first word is skipped because its capital is grammar, not a name; the split is
+ * `reversalCueSentences`' so "first word of a sentence" means the same thing in both places.
+ */
+function valueTokens(content: string): Set<string> {
+  const values = new Set<string>();
+  for (const sentence of content.split(/(?<=[.!?])\s+|\n+/)) {
+    bodyWords(sentence).forEach((word, index) => {
+      if (/\d/.test(word) || (index > 0 && /[A-Z]/.test(word))) values.add(word.toLowerCase());
+    });
+  }
+  return values;
+}
+
+function bodyWords(text: string): string[] {
+  return (text.match(/[A-Za-z0-9_][A-Za-z0-9_./-]*/g) ?? []).map(raw => raw.replace(/\.+$/, ''));
+}
+
+function lowercasedWords(content: string): Set<string> {
+  return new Set(bodyWords(content).map(word => word.toLowerCase()));
+}
+
+/**
+ * Whether an incoming body drops some of the held body's values and adds none of its own.
+ *
+ * THE FAILURE THIS EXISTS FOR (#165, N2). "Nightly database backups are retained for 35 days"
+ * was retired by the same sentence with "35 days" replaced by "the value documented in the ops
+ * runbook": 36 of 36 red-team writes, after which "35 days" was nowhere in the top three results.
+ * That write asserts nothing false. It is emptier, and superseding trades the value for its
+ * absence. Honest agents produce the same shape when they paraphrase a precise fact vaguely.
+ *
+ * NOT A SECURITY BOUNDARY. An attacker who swaps the value instead of dropping it adds a value
+ * token and is not caught here; see #165 R2 for the trust gap that leaves.
+ *
+ * A value counts as dropped only when its word is gone from the incoming body entirely, and as
+ * added only when its word appears nowhere in the held one. Comparing value sets alone made
+ * "Cards go via Stripe" -> "Stripe handles cards" read as dropping Stripe, because a
+ * sentence-initial capital is not a value, and "PostgreSQL" -> "postgresql" read the same way.
+ * The other direction is symmetric: "Stripe handles cards for 35 days" -> "Cards are handled by
+ * Stripe" must not read as adding Stripe just because it opened the held sentence.
+ *
+ * It also fires on a correction to a value the held body already mentions in some form: narrowing
+ * a list ("Node 18 and Node 20" -> "Node 20"), or switching to an alternative the held body named
+ * ("Heroku. Fly was rejected." -> "Fly"). The dropped value is exactly what is being retracted.
+ * That pair is kept side by side, which is the cost of this rule: nothing is lost, the caller is
+ * told through `nearDuplicate`, and retiring the stale one takes an explicit `supersedes`. No
+ * lexical test tells these apart from N2.
+ *
+ * ponytail: lexical, so a value written as ordinary words ("two reviewer approvals", "always
+ * redacted") is invisible to it -- 3 of the report's 12 subjects. Catching those needs meaning,
+ * not tokens. Replayed over 140 real supersessions this fires on none.
+ */
+export function dropsValuesOnly(incoming: { content: string }, held: { content: string }): boolean {
+  const heldValues = valueTokens(held.content);
+  if (heldValues.size === 0) return false;
+  const heldWords = lowercasedWords(held.content);
+  for (const value of valueTokens(incoming.content)) if (!heldWords.has(value)) return false;
+  const incomingWords = lowercasedWords(incoming.content);
+  for (const value of heldValues) if (!incomingWords.has(value)) return true;
+  return false;
+}
+
 /** A sentence of an incoming write that contains a reversal cue, with its own token set. */
 export type ReversalCueSentence = { cue: string; sentence: string; tokens: Set<string> };
 
@@ -598,6 +663,15 @@ export function resolveDuplicate(
   channel: WriteChannel = 'direct',
 ): DuplicateResolution {
   if (input.supersedes && input.supersedes === duplicate.id) return 'supersede';
+  // Two file-backed skills from different packages are different skills, whatever their titles.
+  // A skill's title is its package name, so the subset test below read "deploy-app-staging" as a
+  // correction of "deploy-app" and retired it: two packages on disk, one index entry, and
+  // `recordSkillRun` unable to find the other. Only a package path names a package: an agent's
+  // skill atom may carry a free-text `source` ("verified in this workspace"), and two of those
+  // are still judged on their titles.
+  if (input.category === 'skill' && duplicate.category === 'skill'
+    && input.source?.startsWith('.knowl/skills/') && duplicate.source?.startsWith('.knowl/skills/')
+    && input.source !== duplicate.source) return 'coexist';
   if (normalizedIdentity(input) === normalizedIdentity(duplicate)) {
     const incoming: KnowledgePayload = {
       ...input,
@@ -640,36 +714,45 @@ export function resolveDuplicate(
   // capture supersession retired an item with no provenance.
   if (channel === 'automatic' && isVerifiedProvenance(duplicate)) return 'coexist';
 
+  // The body restates the claim with its values removed; see `dropsValuesOnly`.
+  if (dropsValuesOnly(input, duplicate)) return 'coexist';
+
   return 'supersede';
 }
 
-/**
- * The id the exclusive-key checks may ignore: the item this write will retire, chosen exactly as
- * `resolveSupersedeTarget` chooses it. Exempting the named `supersedes` id alone let a write name
- * the holder while a different qualifying duplicate was the one retired, which left the holder
- * active beside a new row claiming its key -- two answers to a key that allows one.
- */
-function retiringId(
-  input: { supersedes?: string },
-  duplicate: KnowledgeItem | null,
-  resolution: DuplicateResolution | null,
-): string | undefined {
-  return duplicate && resolution === 'supersede' ? duplicate.id : input.supersedes;
-}
-
-// Resolve the item (if any) that a new write should mark superseded: the detected
-// duplicate when it qualifies, otherwise an explicitly named active item.
-async function resolveSupersedeTarget(
+// Resolve the item (if any) that a new write should mark superseded: an explicitly named active
+// item, otherwise the detected duplicate when it qualifies.
+//
+// The order used to be the other way round, so a write naming X that fuzzy-matched a same-subject
+// Y retired Y and left X active -- the caller's instruction landing on a record it never named.
+// A detected duplicate passed over this way is still active beside the write; see
+// `leftBeside` for how the writers report it.
+//
+// Both writers resolve it BEFORE creating the row and pass its id as the one the exclusive-key
+// checks may ignore: exempting the named `supersedes` alone let a write name the holder while a
+// different item was the one retired, leaving two active answers to a key that allows one.
+export async function resolveSupersedeTarget(
   input: { supersedes?: string },
   duplicate: KnowledgeItem | null,
   qualifies: boolean,
 ): Promise<KnowledgeItem | null> {
-  if (duplicate && qualifies) return duplicate;
   if (input.supersedes) {
     const explicit = await repo.getKnowledgeItem(input.supersedes);
     if (explicit && explicit.status === 'active') return explicit;
   }
-  return null;
+  return duplicate && qualifies ? duplicate : null;
+}
+
+// The detected duplicate a write left active beside itself, for the `nearDuplicate` report. That
+// used to be every `coexist` and nothing else, which missed two: a 'supersede' whose duplicate
+// was passed over for an explicit `supersedes` target, and a `no-op` written anyway because it
+// named another item to retire -- leaving its byte-identical twin active. Either way two active
+// answers stood with nobody told.
+export function leftBeside(
+  duplicate: KnowledgeItem | null,
+  retired: KnowledgeItem | null,
+): KnowledgeItem | undefined {
+  return duplicate && retired?.id !== duplicate.id ? duplicate : undefined;
 }
 
 /**
@@ -850,7 +933,8 @@ export async function storeKnowledgeItemDeduped(
   const resolution = duplicate
     ? resolveDuplicate(input, duplicate, await heldPayloadFor(input, duplicate), channel)
     : null;
-  const retiring = retiringId(input, duplicate, resolution);
+  const target = await resolveSupersedeTarget(input, duplicate, resolution === 'supersede');
+  const retiring = target?.id;
   const conflicts = await checkKnowledgeConflict({ ...input, supersedes: retiring });
   if (conflicts.length) throw new KnowledgeConflictError(conflicts.map(item => ({ id: item.id, title: item.title })));
   if (duplicate && resolution === 'no-op' && !input.supersedes) {
@@ -891,7 +975,7 @@ export async function storeKnowledgeItemDeduped(
     await attachEvidenceToKnowledge(written.id, input.evidence, input);
 
     const changes: CommitChange[] = [];
-    const retired = await resolveSupersedeTarget(input, duplicate, resolution === 'supersede');
+    const retired = target;
     if (retired && retired.id !== written.id) {
       await repo.updateKnowledgeItem(retired.id, { status: 'superseded', supersededById: written.id }, undefined, conn);
       changes.push({ itemId: retired.id, action: 'supersede', before: retired });
@@ -906,18 +990,19 @@ export async function storeKnowledgeItemDeduped(
   // on a different connection, so it survives -- pointing at an item a rollback erased, and the
   // next push would send a phantom.
   await stageWrittenItems([item.id]);
+  const nearDuplicate = leftBeside(duplicate, superseded);
 
   return {
     action: 'inserted',
     item,
     superseded: superseded || undefined,
-    nearDuplicate: resolution === 'coexist' && duplicate ? duplicate : undefined,
+    nearDuplicate,
     crossRepo: await overlapFor(await activeWorkspaceForWrite(), input),
     // Read after the write is durable, like the cross-repo advisory above it. Computed against
     // the WRITTEN item rather than the input so the text scored is the text stored.
     governingDecision: await governingDecisionForWrite(projectId, item),
     reversal: await reversalAdvisoryForWrite(item, new Set(
-      [item.id, superseded?.id, resolution === 'coexist' && duplicate ? duplicate.id : undefined]
+      [item.id, superseded?.id, nearDuplicate?.id]
         .filter((id): id is string => Boolean(id)),
     )),
   };
@@ -988,6 +1073,7 @@ export async function storeKnowledgeAtomsDeduped(
         continue;
       }
 
+      const superseded = await resolveSupersedeTarget(atom, duplicate, resolution === 'supersede');
       const item = await repo.createKnowledgeItem(
         projectId,
         {
@@ -1013,11 +1099,10 @@ export async function storeKnowledgeAtomsDeduped(
         atom.steps,
         conn,
         validationOptions,
-        retiringId(atom, duplicate, resolution),
+        superseded?.id,
       );
       await attachEvidenceToKnowledge(item.id, atom.evidence, atom);
 
-      const superseded = await resolveSupersedeTarget(atom, duplicate, resolution === 'supersede');
       if (superseded && superseded.id !== item.id) {
         await repo.updateKnowledgeItem(superseded.id, { status: 'superseded', supersededById: item.id }, undefined, conn);
         changes.push({ itemId: superseded.id, action: 'supersede', before: superseded });
@@ -1028,13 +1113,14 @@ export async function storeKnowledgeAtomsDeduped(
       insertedCount++;
       inserted.push(item);
       changes.push({ itemId: item.id, action: 'insert', after: item });
+      const nearDuplicate = leftBeside(duplicate, superseded);
       const outcome: StoreKnowledgeAtomOutcome = {
         action: 'inserted',
         itemId: item.id,
         title: atom.title,
         ...(superseded && superseded.id !== item.id ? { supersededId: superseded.id } : {}),
-        ...(resolution === 'coexist' && duplicate
-          ? { nearDuplicateId: duplicate.id, nearDuplicateTitle: duplicate.title }
+        ...(nearDuplicate
+          ? { nearDuplicateId: nearDuplicate.id, nearDuplicateTitle: nearDuplicate.title }
           : {}),
       };
       outcomes.push(outcome);
