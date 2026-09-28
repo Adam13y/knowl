@@ -100,6 +100,30 @@ const REVERSAL_CUES = [
   'reversed', 'obsolete', 'replaced by', 'overturned', 'rescinded', 'retracted',
 ];
 
+/**
+ * Who decided this atom should exist.
+ *
+ * THE FAILURE THIS EXISTS FOR (#165). A same-subject write retired whatever it matched, whoever
+ * wrote it. A sentence a model lifted from a transcript or a pasted README retired a fact a person
+ * had verified, exactly as an agent's deliberate correction would: 216 of 216 red-team writes, and
+ * afterwards nothing listed the swap, because `scanContradictions` pairs only active items.
+ *
+ * The payload cannot tell the two apart. Matched attack/correction pairs differ in none of seven
+ * structural fields. The channel can, because it is chosen by the code path that calls the
+ * writer and not by anything in the atom -- which is why it is a function parameter and never a
+ * field on the input: MCP handlers build the input from caller arguments.
+ *
+ * `automatic` callers today: session capture (`candidate-promotion.ts`), transcript approval
+ * (`approve-candidates.ts`), raw ingest (`runPipeline` -> `runMerge`) and truth derivation
+ * (`derive.ts`). Everything else is an explicit act by an agent or person and is `direct`.
+ */
+export type WriteChannel = 'direct' | 'automatic';
+
+/** `observed` or `user_stated`: someone claimed to have checked it. */
+export function isVerifiedProvenance(item: { provenance?: KnowledgeProvenance | null }): boolean {
+  return item.provenance === 'observed' || item.provenance === 'user_stated';
+}
+
 export interface StoreKnowledgeInput {
   category: KnowledgeCategory;
   title: string;
@@ -567,6 +591,10 @@ export function resolveDuplicate(
     & { evidence?: EvidenceInput[] | string[] },
   duplicate: KnowledgeItem,
   held?: KnowledgePayload,
+  // ponytail: defaults to direct, as do both writers and `MergeOptions.channel`, so each
+  // automatic caller opts in; a new automatic channel must pass 'automatic' itself. See
+  // `WriteChannel` for the list.
+  channel: WriteChannel = 'direct',
 ): DuplicateResolution {
   if (input.supersedes && input.supersedes === duplicate.id) return 'supersede';
   if (normalizedIdentity(input) === normalizedIdentity(duplicate)) {
@@ -588,7 +616,7 @@ export function resolveDuplicate(
   //
   // The titles are the same claim asserted both ways; see `POLARITY_TOKENS`.
   //
-  // NOT GUARDED ON PROVENANCE, and that was measured rather than assumed. A second guard was
+  // NOT GUARDED ON PROVENANCE FOR A DIRECT WRITE, and that was measured rather than assumed. A second guard was
   // proposed here -- refuse to let an atom with no provenance retire one claiming `observed` or
   // `user_stated` -- and replayed against this repo's 101 real supersessions it would have
   // blocked 3, all three of them legitimate corrections. One of the three is an atom whose entire
@@ -599,6 +627,12 @@ export function resolveDuplicate(
   // refusing a supersession, and a pair left coexisting is invisible afterwards: `knowl_conflicts`
   // reads only `conflictKey`/`conflictExclusive`, set on 3 of 937 active items.
   if (differsOnlyInPolarity(input, duplicate)) return 'coexist';
+
+  // Provenance still does not gate a DIRECT write (the measurement above stands: 5 of 139 real
+  // supersessions are unclaimed corrections of observed items, all through knowl_store). What it
+  // gates is an AUTOMATIC one: replayed over the same 139, this line blocks none of them -- every
+  // capture supersession retired an item with no provenance.
+  if (channel === 'automatic' && isVerifiedProvenance(duplicate)) return 'coexist';
 
   return 'supersede';
 }
@@ -788,6 +822,7 @@ export async function storeKnowledgeItemDeduped(
   input: StoreKnowledgeInput,
   commitMessage?: string,
   validationOptions?: KnowledgeWriteValidationOptions,
+  channel: WriteChannel = 'direct',
 ): Promise<StoreKnowledgeResult> {
   assertConfidenceInRange(input.confidence, input.title);
   validationOptions ??= await securityForWrite();
@@ -795,7 +830,7 @@ export async function storeKnowledgeItemDeduped(
   if (conflicts.length) throw new KnowledgeConflictError(conflicts.map(item => ({ id: item.id, title: item.title })));
   const duplicate = await findLikelyDuplicateKnowledgeItem(projectId, input);
   const resolution = duplicate
-    ? resolveDuplicate(input, duplicate, await heldPayloadFor(input, duplicate))
+    ? resolveDuplicate(input, duplicate, await heldPayloadFor(input, duplicate), channel)
     : null;
   if (duplicate && resolution === 'no-op' && !input.supersedes) {
     // The agent reached this conclusion again and the store already had it. That is the one
@@ -888,6 +923,7 @@ export async function storeKnowledgeAtomsDeduped(
   atoms: StoreKnowledgeInput[],
   commitMessage?: string,
   validationOptions?: KnowledgeWriteValidationOptions,
+  channel: WriteChannel = 'direct',
 ): Promise<StoreKnowledgeBatchResult> {
   // Every atom's confidence, before the first one is written -- the same reason the ownership
   // guard is hoisted out of the loop. A batch is all-or-nothing, so a per-atom check would
@@ -920,7 +956,7 @@ export async function storeKnowledgeAtomsDeduped(
       });
 
       const resolution = duplicate
-        ? resolveDuplicate(atom, duplicate, await heldPayloadFor(atom, duplicate))
+        ? resolveDuplicate(atom, duplicate, await heldPayloadFor(atom, duplicate), channel)
         : null;
       if (duplicate && resolution === 'no-op' && !atom.supersedes) {
         await recordRederivationBestEffort(duplicate.id);

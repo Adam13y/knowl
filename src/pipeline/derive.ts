@@ -4,6 +4,7 @@ import * as schema from '../store/schema.js';
 import * as repo from '../store/repository.js';
 import { deriveTruth } from '../ai/provider.js';
 import { KnowledgeItem, CommitChange } from '../core/types.js';
+import { isVerifiedProvenance } from '../store/knowledge-writer.js';
 
 export interface DeriveResult {
   derivedTruthsCount: number;
@@ -81,8 +82,12 @@ export async function runDeriveTruth(
       );
 
       if (existing) {
-        // If value has changed, update it
-        if (existing.content !== truth.value) {
+        // A derived value is a model's reading of the item just written -- and raw ingest is how
+        // arbitrary text reaches here -- so it may not rewrite a state item someone verified.
+        // The skipped value is not recomputed later: derivation runs only on new writes. The
+        // cost is a verified state item that can go stale beside a newer decision until a
+        // person corrects it, which is the trade #165 asks for.
+        if (existing.content !== truth.value && !isVerifiedProvenance(existing)) {
           const updated = await repo.updateKnowledgeItem(
             existing.id,
             { content: truth.value },
