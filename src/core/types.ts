@@ -312,7 +312,6 @@ export interface ProjectConfig {
   search?: {
     vector?: {
       enabled?: boolean;
-      provider?: 'local';
       /** Named profile bundling model, dtype and pooling. See resolveVectorProfile. */
       preset?: string;
       model?: string;
@@ -510,8 +509,8 @@ export interface ProjectConfig {
      * still asked.
      */
     scope?: 'conversation' | 'turn';
-    /** The periodic assumption checkpoint. `ask` arms it; absent means off. See #184. */
-    checkpoint?: 'off' | 'ask';
+    /** The periodic assumption checkpoint. `ask` arms it; absent means `shadow`. See #184. */
+    checkpoint?: 'off' | 'shadow' | 'ask';
   };
   /**
    * Awareness of the other agent sessions running on this machine.

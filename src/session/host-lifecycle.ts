@@ -96,6 +96,9 @@ import {
 import { bootstrapAgentSession } from '../store/context-bootstrap.js';
 import { consumePendingSessionHandoff, recordPendingSessionHandoff } from './session-handoff.js';
 import { DEFAULT_CONTEXT_MAX_CHARS, truncateText } from '../core/token-budget.js';
+import { isUpdateCheckEnabled, markUpdateNotified, readCachedUpdate } from '../core/version-check.js';
+import { PACKAGE_NAME, PACKAGE_VERSION } from '../version.js';
+import type { ProjectConfig } from '../core/types.js';
 import { describeAutoDrift, runAutoDriftCheckBestEffort, type AutoDriftResult } from '../store/drift-auto.js';
 import {
   describeConfirmedFeedbackPromotions, describeObservedUsePromotions,
@@ -957,6 +960,23 @@ async function staleGuidanceWarningBestEffort(projectRoot: string): Promise<stri
     + 'to refresh them.';
 }
 
+/**
+ * One line naming a newer release, read from the cache the MCP server refreshes -- never a fetch,
+ * because the host waits on this hook. Marked as shown before it returns, so each release is
+ * named once rather than at every session start.
+ */
+async function updateNoticeBestEffort(projectRoot: string, config: ProjectConfig | null): Promise<string | null> {
+  try {
+    if (!isUpdateCheckEnabled(config)) return null;
+    const cached = await readCachedUpdate(projectRoot, PACKAGE_VERSION);
+    if (!cached?.updateAvailable || cached.notified) return null;
+    await markUpdateNotified(projectRoot, cached.latest);
+    return `Knowl ${PACKAGE_VERSION} → ${cached.latest} is available: npm install -g ${PACKAGE_NAME}. Tell the user.`;
+  } catch {
+    return null;
+  }
+}
+
 export async function handleHostLifecycleEvent(projectId: string, input: NormalizedHostHook): Promise<HostLifecycleResult> {
   // First, and claimed before anything else can mistake it for a session boundary: every event
   // this function does not recognise falls through to the session-stop handler at the bottom, and
@@ -1012,8 +1032,11 @@ export async function handleHostLifecycleEvent(projectId: string, input: Normali
     // Standing last of the three: it reports something the store already did successfully,
     // where the other two are warnings that the work ahead may be built on bad ground. If the
     // cap drops a line, drop this one.
+    const sessionConfig = await loadConfig(input.projectRoot).catch(() => null);
     const warning = truncateText([
       await staleGuidanceWarningBestEffort(input.projectRoot),
+      input.startNotice,
+      await updateNoticeBestEffort(input.projectRoot, sessionConfig),
       describeAutoDrift(drift),
       describeObservedUsePromotions(standing),
       describeConfirmedFeedbackPromotions(confirmed),
@@ -1021,7 +1044,7 @@ export async function handleHostLifecycleEvent(projectId: string, input: Normali
     // The roster of other live sessions rides below the warnings and above the knowledge, and
     // is charged against the cap the same way: it is empty for a session that is alone, and
     // for a fleet of twenty it is the few lines that tell the agent the others exist at all.
-    const roster = await fleetSessionStartBestEffort(input, await loadConfig(input.projectRoot).catch(() => null));
+    const roster = await fleetSessionStartBestEffort(input, sessionConfig);
     const preface = truncateText([warning, roster].filter(Boolean).join('\n\n'), DEFAULT_CONTEXT_MAX_CHARS);
     const recentBudget = preface
       ? Math.max(0, DEFAULT_CONTEXT_MAX_CHARS - preface.length - 2)
@@ -1217,7 +1240,8 @@ export async function handleHostLifecycleEvent(projectId: string, input: Normali
       // on a write that was happening anyway. Counted in TURNS rather than tool events, because
       // the sessions worth checkpointing are long on reasoning and short on tools, which is the
       // same reason `MIN_SUBSTANTIVE_TURNS` counts turns.
-      const checkpointWindow = captureCheckpointMode(captureConfig ?? undefined) === 'ask'
+      const checkpointMode = captureCheckpointMode(captureConfig ?? undefined);
+      const checkpointWindow = checkpointMode !== 'off'
         ? await readCaptureOutcome(conversationKey(input))
           .then(outcome => {
             const turns = outcome?.turns ?? 0;
@@ -1226,6 +1250,11 @@ export async function handleHostLifecycleEvent(projectId: string, input: Normali
           })
           .catch(() => null)
         : null;
+      // Shadow claims the window it would have asked in, already settled, and says nothing: the
+      // same ledger and the same `shadow` word `capture.events` records a withheld lesson with.
+      if (checkpointMode === 'shadow' && checkpointWindow !== null) {
+        await claimAssumptionCheckpoint(conversationKey(input), checkpointWindow, 'shadow');
+      }
       const impact = input.status === 'failed' ? [] : await runToolEventImpact(input, started.session.id);
       await observeToolTouch(input, projectId);
       // The fleet sees every event, failed ones included: a failure is the signal that
@@ -1342,7 +1371,7 @@ export async function handleHostLifecycleEvent(projectId: string, input: Normali
             // Only a durable write quiets this one, by zeroing the verdict itself.
             await resetHostSuccessfulToolCount(key);
             hostOutput = profile.midTurnContext(renderTurnCapturePrompt());
-          } else if (checkpointWindow !== null
+          } else if (checkpointMode === 'ask' && checkpointWindow !== null
             && await claimAssumptionCheckpoint(conversationKey(input), checkpointWindow)) {
             // Below every observed-event branch and above the drift reminder, deliberately.
             //
