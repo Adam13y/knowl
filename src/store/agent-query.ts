@@ -3,6 +3,7 @@ import { queryKnowledgeCandidates } from './queries.js';
 import { findEmbeddedItemIds, searchKnowledgeEmbeddings } from './vector.js';
 import { recordKnowledgeAccessBestEffort } from './access-feedback.js';
 import { localStore, type StoreHandle } from './store-handle.js';
+import { duplicateTokens, isVerifiedProvenance, polarityTokensDiffer, sameSubjectTokens } from './knowledge-writer.js';
 
 const DEFAULT_AGENT_QUERY_LIMIT = 3;
 /** Exported so cross-store fusion uses the same constant rather than restating it. */
@@ -383,6 +384,80 @@ function withoutDuplicates<T extends { result: { item: KnowledgeItem } }>(
 
   // Demotion, not deletion: a duplicate still fills the page when nothing else can.
   return [...kept, ...deferred].slice(0, limit);
+}
+
+/**
+ * A newer item never outranks the older verified item it was kept beside (#323).
+ *
+ * Two active same-subject items in one category should only exist because the write path chose
+ * `coexist`: every other same-subject write either retires the held item or is a no-op. Since
+ * #319 that is where an automatic write lands when it contradicts a verified fact, and every
+ * prior above reads a field the writer controls (provenance, confidence) or one that favours the
+ * newcomer (recency), so a planted item claiming `observed` at 0.99 won top-1 in 21/36 of the rerun.
+ *
+ * Reordering, not rescoring: the newcomer is moved to directly below its older twin and keeps its
+ * score, so it still reaches the page and `knowl conflicts` still lists the pair. Polarity pairs
+ * are not reordered (a genuine reversal would sink below the fact it reverses); they are still
+ * flagged `contested`.
+ */
+type TwinRow = { item: KnowledgeItem; repo?: string };
+
+/**
+ * Whether `newer` is a same-subject item kept beside the older verified `older`.
+ *
+ * `polarity` says whether a negation pair ("X" / "X no longer") counts. It does for the
+ * `contested` flag -- adding "no longer" to a planted title must not dodge the warning -- and
+ * does not for the reorder, which would bury a genuine reversal below the fact it reverses.
+ */
+function twinTest<R extends TwinRow>(polarity: boolean): (newer: R, older: R) => boolean {
+  const tokens = new Map<string, Set<string>>();
+  const tokensOf = (item: KnowledgeItem) => {
+    let built = tokens.get(item.id);
+    if (!built) { built = duplicateTokens(item.title); tokens.set(item.id, built); }
+    return built;
+  };
+  // Same repo is part of the pair: scoring runs over a whole workspace, and a peer's older item
+  // is not the thing a local write was kept beside -- pinning it would reorder across repos.
+  return (newer, older) =>
+    newer.repo === older.repo
+    && newer.item.status === 'active' && older.item.status === 'active'
+    && newer.item.category === older.item.category
+    && isVerifiedProvenance(older.item)
+    && Date.parse(older.item.createdAt) < Date.parse(newer.item.createdAt)
+    && sameSubjectTokens(tokensOf(newer.item), tokensOf(older.item))
+    && (polarity || !polarityTokensDiffer(tokensOf(newer.item), tokensOf(older.item)));
+}
+
+export function olderTwinFirst<T extends { result: TwinRow }>(scored: T[]): T[] {
+  const out = [...scored];
+  const isTwin = twinTest<TwinRow>(false);
+  for (let i = 0; i < out.length; i++) {
+    const j = out.findIndex((older, k) => k > i && isTwin(out[i].result, older.result));
+    if (j < 0) continue;
+    out.splice(i, 0, ...out.splice(j, 1));
+    i--; // the item now at i may itself have an older twin further down
+  }
+  return out;
+}
+
+/**
+ * Ids of the page rows that have a same-subject verified twin kept beside them (#323, option 3).
+ *
+ * Reordering makes the verified item win a top-1 read; this is what tells the reader there were
+ * two answers at all. `pool` is where the twin is looked for -- the whole scored list, so a
+ * `limit: 1` page whose twin was cut still says so. Polarity pairs count here.
+ * ponytail: O(page x pool) over the candidate list, never the store; link at write time (R4) if it grows.
+ */
+export function contestedOnPage<T extends { result: TwinRow }>(page: T[], pool: T[] = page): Set<string> {
+  const isTwin = twinTest<TwinRow>(true);
+  const ids = new Set<string>();
+  for (const a of page) {
+    for (const b of pool) {
+      if (a === b) continue;
+      if (isTwin(a.result, b.result) || isTwin(b.result, a.result)) ids.add(a.result.item.id);
+    }
+  }
+  return ids;
 }
 
 export async function queryKnowledgeForAgent(
@@ -789,7 +864,8 @@ export function scoreCandidates<T extends Candidate & { repo?: string }>(
     }
   }
 
-  const selected = withoutDuplicates(scored, limit);
+  const selected = withoutDuplicates(olderTwinFirst(scored), limit);
+  const contested = contestedOnPage(selected, scored);
 
   // Whether `score` is a calibrated relevance for this row, and if not, why -- so the surface
   // can say "no opinion" instead of publishing a number that reads as a verdict. Both reasons
@@ -821,6 +897,8 @@ export function scoreCandidates<T extends Candidate & { repo?: string }>(
         vectorRank: result.vectorRank,
         // Present only when true: an answered query is the common case and pays nothing.
         ...(abstained.has(result.item.id) ? { abstained: true } : {}),
+        // Same economy: present only on the rows of a same-subject pair kept side by side.
+        ...(contested.has(result.item.id) ? { contested: true } : {}),
         // Same economy: present only on a row whose number is not a calibrated relevance.
         ...(uncalibrated ? { uncalibrated } : {}),
         // The raw cosine, straight off `contributions.semantic` -- `rescaleSemantic` is applied

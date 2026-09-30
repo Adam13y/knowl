@@ -236,6 +236,13 @@ export type KnowledgeSearchExplanation = {
    */
   abstained?: boolean;
   /**
+   * This row has a same-subject twin, kept side by side, and the older of the two is verified
+   * (#323). The twin may not be on the page. Present only when true. The ranker puts the older
+   * item first; this says there is a second answer, and that the newer one was never confirmed
+   * against the older.
+   */
+  contested?: boolean;
+  /**
    * `finalScore` is not a calibrated relevance for this row, and this is why. Present only
    * when set, mirroring `abstained`, so the calibrated path costs nothing.
    *

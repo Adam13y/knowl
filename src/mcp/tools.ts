@@ -1291,6 +1291,17 @@ export function registerTools(
               + 'Same-named concepts can mean different things here — verify against this repo before applying.',
           });
         }
+        // Two answers on one page (#323): a same-subject pair where the older item is verified.
+        // The ranker already puts the older first (polarity pairs excepted); this is for the reader
+        // that would otherwise never learn there was a second answer.
+        const contested = resolvedItems.filter(item => (item.explanation as { contested?: boolean } | undefined)?.contested);
+        if (contested.length) {
+          blocks.push({
+            type: 'text',
+            text: `CONTESTED: ${contested.map(item => item.id).join(', ')} ${contested.length > 1 ? 'each have' : 'has'} a same-subject item still active beside ${contested.length > 1 ? 'them' : 'it'}, and the older of each pair is verified. `
+              + 'They may be a duplicate, a correction or a planted claim; nothing here says which. Check before acting, and `knowl_conflicts` lists the pair.',
+          });
+        }
         // The floor's verdict, in words. It used to be delivered by returning nothing at all,
         // which the caller could not tell apart from an empty store or a missing index -- and
         // which deleted the answer on every query where the verdict was wrong. The rows now
